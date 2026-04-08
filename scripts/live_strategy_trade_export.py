@@ -19,6 +19,8 @@ DEFAULT_OUTPUT = Path(r"C:\VScode\Reports\Live\apolloes-hermes-live-trades.json"
 DEFAULT_STRATEGIES = ("ApolloES", "Hermes")
 SQLITE_TIMEOUT_SECONDS = 5.0
 INVALID_DOUBLE_SENTINEL = 1.7976931348623157e308
+ATOMIC_REPLACE_MAX_ATTEMPTS = 10
+ATOMIC_REPLACE_RETRY_SECONDS = 0.25
 try:
     SESSION_TIMEZONE = ZoneInfo("America/New_York")
 except Exception:
@@ -286,11 +288,36 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         temp_path = Path(handle.name)
 
     try:
-        temp_path.replace(path)
+        last_error: Exception | None = None
+        for attempt in range(1, ATOMIC_REPLACE_MAX_ATTEMPTS + 1):
+            try:
+                temp_path.replace(path)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+                if attempt >= ATOMIC_REPLACE_MAX_ATTEMPTS:
+                    raise
+                time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
+        if last_error is not None:
+            raise last_error
     except Exception:
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
         raise
+
+
+def choose_private_output_path(output_path: Path) -> Path:
+    return output_path.with_name(output_path.stem + ".writer.json")
+
+
+def publish_public_snapshot(public_path: Path, payload: dict[str, Any], log_path: Path | None = None) -> bool:
+    try:
+        atomic_write_json(public_path, payload)
+        return True
+    except Exception as exc:
+        append_log_line(log_path, f"Public snapshot publish failed for {public_path}: {exc}")
+        return False
 
 
 def choose_runtime_status_dir(output_path: Path) -> Path:
@@ -995,9 +1022,10 @@ def write_snapshot(
         max_closed_trades=max_closed_trades,
         runtime_status_dir=runtime_status_dir,
     )
-    atomic_write_json(output_path, payload)
+    private_output_path = choose_private_output_path(output_path)
+    atomic_write_json(private_output_path, payload)
     source = payload["source"]
-    return source["last_execution_row_id"], source["last_execution_time_utc"]
+    return source["last_execution_row_id"], source["last_execution_time_utc"], payload
 
 
 def run_watch_loop(args: argparse.Namespace) -> None:
@@ -1017,18 +1045,24 @@ def run_watch_loop(args: argparse.Namespace) -> None:
     append_log_line(log_path, f"Watcher starting for {output_path}")
     while True:
         try:
-            row_id, row_time = write_snapshot(
+            row_id, row_time, payload = write_snapshot(
                 db_path=db_path,
                 output_path=output_path,
                 target_strategies=target_strategies,
                 max_closed_trades=int(args.max_closed_trades),
                 runtime_status_dir=runtime_status_dir,
             )
+            published_public = publish_public_snapshot(output_path, payload, log_path)
             if row_id != last_written_row_id:
+                private_output_path = choose_private_output_path(output_path)
                 message = (
-                    f"wrote {output_path} "
+                    f"wrote {private_output_path} "
                     f"(last_execution_row_id={row_id}, last_execution_time_utc={row_time})"
                 )
+                if published_public:
+                    message += f" | published {output_path}"
+                else:
+                    message += f" | public publish deferred for {output_path}"
                 print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
                 append_log_line(log_path, message)
                 last_written_row_id = row_id
