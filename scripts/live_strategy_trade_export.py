@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 DEFAULT_WORKSPACE_DB = Path(r"C:\VScode\NinjaTrader.sqlite")
 DEFAULT_NT_DB = Path.home() / "Documents" / "NinjaTrader 8" / "db" / "NinjaTrader.sqlite"
 DEFAULT_OUTPUT = Path(r"C:\VScode\Reports\Live\apolloes-hermes-live-trades.json")
-DEFAULT_STRATEGIES = ("ApolloES", "Hermes")
+DEFAULT_STRATEGIES = ("ApolloES", "ApolloMES", "Hermes", "Lazarus", "Icarus")
 SQLITE_TIMEOUT_SECONDS = 5.0
 INVALID_DOUBLE_SENTINEL = 1.7976931348623157e308
 ATOMIC_REPLACE_MAX_ATTEMPTS = 10
@@ -73,7 +73,7 @@ def choose_default_db_path() -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Export live NinjaTrader ApolloES/Hermes trades into a JSON file and optionally keep it updated in real time."
+            "Export live NinjaTrader ApolloES/ApolloMES/Hermes/Lazarus/Icarus trades into a JSON file and optionally keep it updated in real time."
         )
     )
     parser.add_argument(
@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
         "--strategy",
         action="append",
         default=[],
-        help="Strategy name to include. Repeat for multiple values. Defaults to ApolloES and Hermes.",
+        help="Strategy name to include. Repeat for multiple values. Defaults to ApolloES, ApolloMES, Hermes, Lazarus, and Icarus.",
     )
     parser.add_argument(
         "--max-closed-trades",
@@ -174,6 +174,8 @@ def normalize_strategy_name(
             return "Hermes"
         if candidate.startswith("APOLLO_"):
             return "ApolloES"
+        if candidate.startswith("ICARUS_"):
+            return "Icarus"
     return None
 
 
