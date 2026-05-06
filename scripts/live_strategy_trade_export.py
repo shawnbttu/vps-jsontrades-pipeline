@@ -26,6 +26,9 @@ try:
 except Exception:
     SESSION_TIMEZONE = None
 DB_CONFIRMATION_WINDOW_SECONDS = 60.0
+ORDER_LIFECYCLE_STALE_SECONDS = 300.0
+RUNTIME_STATUS_STALE_SECONDS = 300.0
+RUNTIME_STATUS_FUTURE_SKEW_SECONDS = 120.0
 ORDER_ACCEPTED_STATE_CODES = {1, 2, 3, 6, 7, 8, 9, 10}
 
 ORDER_ACTION_NAMES = {
@@ -338,6 +341,19 @@ def append_log_line(log_path: Path | None, message: str) -> None:
         handle.write(f"[{timestamp}] {message}\n")
 
 
+def isoformat_utc(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def file_mtime_utc(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    except Exception:
+        return None
+
+
 def build_execution_payload(row: sqlite3.Row, strategy_name: str) -> dict[str, Any]:
     commission = float(row["Commission"] or 0.0)
     fee = float(row["Fee"] or 0.0)
@@ -388,25 +404,83 @@ def build_execution_payload(row: sqlite3.Row, strategy_name: str) -> dict[str, A
     return payload
 
 
-def load_runtime_statuses(runtime_status_dir: Path, target_strategies: list[str]) -> list[dict[str, Any]]:
+def load_runtime_statuses(
+    runtime_status_dir: Path,
+    target_strategies: list[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    summary: dict[str, Any] = {
+        "directory_exists": runtime_status_dir.exists(),
+        "directory_path": str(runtime_status_dir),
+        "files_seen": 0,
+        "files_loaded": 0,
+        "non_object_count": 0,
+        "parse_error_count": 0,
+        "non_target_strategy_count": 0,
+        "missing_identity_count": 0,
+        "missing_heartbeat_count": 0,
+        "future_heartbeat_count": 0,
+        "stale_heartbeat_count": 0,
+        "latest_seen_heartbeat_utc": None,
+        "latest_loaded_heartbeat_utc": None,
+        "latest_file_mtime_utc": None,
+    }
     if not runtime_status_dir.exists():
-        return []
+        return [], summary
 
     payloads: list[dict[str, Any]] = []
+    now_utc = datetime.now(UTC)
     for path in sorted(runtime_status_dir.glob("*.json")):
+        summary["files_seen"] = int(summary["files_seen"]) + 1
+        path_mtime_utc = file_mtime_utc(path)
+        latest_file_mtime_utc = parse_iso_utc(summary["latest_file_mtime_utc"])
+        if path_mtime_utc is not None and (
+            latest_file_mtime_utc is None or path_mtime_utc > latest_file_mtime_utc
+        ):
+            summary["latest_file_mtime_utc"] = isoformat_utc(path_mtime_utc)
         try:
             parsed = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception:
+            summary["parse_error_count"] = int(summary["parse_error_count"]) + 1
             continue
 
         if not isinstance(parsed, dict):
+            summary["non_object_count"] = int(summary["non_object_count"]) + 1
             continue
 
         strategy_name = parsed.get("strategy")
         if strategy_name not in target_strategies:
+            summary["non_target_strategy_count"] = int(summary["non_target_strategy_count"]) + 1
             continue
 
+        if not parsed.get("account") or not parsed.get("instrument"):
+            summary["missing_identity_count"] = int(summary["missing_identity_count"]) + 1
+            continue
+
+        heartbeat_utc = parse_iso_utc(parsed.get("last_heartbeat_utc"))
+        if heartbeat_utc is None:
+            summary["missing_heartbeat_count"] = int(summary["missing_heartbeat_count"]) + 1
+            continue
+
+        latest_seen_heartbeat_utc = parse_iso_utc(summary["latest_seen_heartbeat_utc"])
+        if latest_seen_heartbeat_utc is None or heartbeat_utc > latest_seen_heartbeat_utc:
+            summary["latest_seen_heartbeat_utc"] = isoformat_utc(heartbeat_utc)
+
+        heartbeat_age_seconds = (now_utc - heartbeat_utc).total_seconds()
+        if heartbeat_age_seconds < (-1 * RUNTIME_STATUS_FUTURE_SKEW_SECONDS):
+            summary["future_heartbeat_count"] = int(summary["future_heartbeat_count"]) + 1
+            continue
+        if heartbeat_age_seconds > RUNTIME_STATUS_STALE_SECONDS:
+            summary["stale_heartbeat_count"] = int(summary["stale_heartbeat_count"]) + 1
+            continue
+
+        parsed["_runtime_heartbeat_age_seconds"] = round(max(heartbeat_age_seconds, 0.0), 3)
+        parsed["_runtime_source_file"] = str(path)
         payloads.append(parsed)
+        summary["files_loaded"] = int(summary["files_loaded"]) + 1
+
+        latest_loaded_heartbeat_utc = parse_iso_utc(summary["latest_loaded_heartbeat_utc"])
+        if latest_loaded_heartbeat_utc is None or heartbeat_utc > latest_loaded_heartbeat_utc:
+            summary["latest_loaded_heartbeat_utc"] = isoformat_utc(heartbeat_utc)
 
     payloads.sort(
         key=lambda item: (
@@ -415,7 +489,7 @@ def load_runtime_statuses(runtime_status_dir: Path, target_strategies: list[str]
             str(item.get("instance_key", "")),
         )
     )
-    return payloads
+    return payloads, summary
 
 
 @dataclass
@@ -658,6 +732,142 @@ def fetch_order_rows(con: sqlite3.Connection, target_strategies: list[str]) -> l
     return list(con.execute(query, tuple(target_strategies)))
 
 
+def fetch_all_execution_rows(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    query = """
+        SELECT
+            e.Id AS ExecutionRowId,
+            e.ExecutionId,
+            e.OrderId,
+            e.IsEntry,
+            e.IsExit,
+            e.Position AS PositionAfter,
+            e.PositionStrategy AS PositionStrategyId,
+            e.MarketPosition AS MarketPositionCode,
+            e.Quantity,
+            e.Price,
+            e.Commission,
+            e.Fee,
+            e.Time AS ExecutionTime,
+            a.Name AS AccountName,
+            mi.Name AS InstrumentName,
+            mi.PointValue,
+            mi.TickSize,
+            o.OrderAction AS OrderActionCode
+        FROM Executions e
+        JOIN Accounts a ON a.Id = e.Account
+        JOIN Instruments i ON i.Id = e.Instrument
+        JOIN MasterInstruments mi ON mi.Id = i.MasterInstrument
+        LEFT JOIN Orders o ON o.OrderId = e.OrderId
+        ORDER BY e.Time ASC, e.Id ASC
+    """
+    return list(con.execute(query))
+
+
+@dataclass
+class SessionRealizedAccumulator:
+    side: str
+    point_value: float
+    current_position: int = 0
+    entry_quantity: int = 0
+    exit_quantity: int = 0
+    entry_notional: float = 0.0
+    exit_notional: float = 0.0
+    total_commission: float = 0.0
+    total_fee: float = 0.0
+
+    def append_execution(self, row: sqlite3.Row) -> None:
+        quantity = int(row["Quantity"] or 0)
+        price = float(row["Price"] or 0.0)
+        self.total_commission += float(row["Commission"] or 0.0)
+        self.total_fee += float(row["Fee"] or 0.0)
+
+        if bool(row["IsEntry"]):
+            self.entry_quantity += quantity
+            self.entry_notional += price * quantity
+            self.current_position += signed_quantity(self.side, quantity)
+            return
+
+        self.exit_quantity += quantity
+        self.exit_notional += price * quantity
+        self.current_position -= signed_quantity(self.side, quantity)
+
+    def is_closed(self) -> bool:
+        return self.current_position == 0 and self.entry_quantity > 0 and self.exit_quantity > 0
+
+    def realized_gross(self) -> float:
+        if self.side == "long":
+            return (self.exit_notional - self.entry_notional) * self.point_value
+        return (self.entry_notional - self.exit_notional) * self.point_value
+
+    def realized_net(self) -> float:
+        return self.realized_gross() - self.total_commission - self.total_fee
+
+
+def compute_execution_derived_session_realized(all_execution_rows: list[sqlite3.Row]) -> dict[str, Any]:
+    now_session_date = session_date_from_utc(datetime.now(UTC))
+    if now_session_date is None:
+        return {
+            "session_date": None,
+            "closed_trade_count": 0,
+            "realized_gross_pnl": 0.0,
+            "realized_total_costs": 0.0,
+            "realized_net_pnl": 0.0,
+            "realized_net_pnl_by_account": {},
+        }
+
+    active: dict[tuple[str, str, int], SessionRealizedAccumulator] = {}
+    closed_trade_count = 0
+    realized_gross_total = 0.0
+    realized_costs_total = 0.0
+    realized_net_by_account: dict[str, float] = {}
+
+    for row in all_execution_rows:
+        execution_dt = nt_ticks_to_datetime_utc(row["ExecutionTime"])
+        execution_session_date = session_date_from_utc(execution_dt)
+        if execution_session_date is None:
+            continue
+
+        account_name = str(row["AccountName"] or "")
+        instrument_name = str(row["InstrumentName"] or "")
+        position_strategy_id = int(row["PositionStrategyId"] or 0)
+        slot_key = (account_name, instrument_name, position_strategy_id)
+
+        accumulator = active.get(slot_key)
+        if accumulator is None:
+            side = infer_side(row["PositionAfter"], row["OrderActionCode"])
+            accumulator = SessionRealizedAccumulator(
+                side=side,
+                point_value=float(row["PointValue"] or 0.0),
+            )
+            active[slot_key] = accumulator
+
+        accumulator.append_execution(row)
+
+        if accumulator.is_closed():
+            gross_pnl = accumulator.realized_gross()
+            net_pnl = accumulator.realized_net()
+            costs = accumulator.total_commission + accumulator.total_fee
+
+            # Attribute realized PnL to the session date on which the trade closes.
+            if execution_session_date == now_session_date:
+                realized_gross_total += gross_pnl
+                realized_costs_total += costs
+                realized_net_by_account[account_name] = realized_net_by_account.get(account_name, 0.0) + net_pnl
+                closed_trade_count += 1
+            active.pop(slot_key, None)
+
+    return {
+        "session_date": now_session_date,
+        "closed_trade_count": closed_trade_count,
+        "realized_gross_pnl": round_money(realized_gross_total),
+        "realized_total_costs": round_money(realized_costs_total),
+        "realized_net_pnl": round_money(realized_gross_total - realized_costs_total),
+        "realized_net_pnl_by_account": {
+            account: round_money(value) for account, value in sorted(realized_net_by_account.items())
+        },
+    }
+
+
 def normalize_runtime_status_code(raw_status_code: str | None, runtime_status: dict[str, Any]) -> str:
     code = str(raw_status_code or "").strip().upper()
     if code in {"ALIVE"}:
@@ -674,11 +884,10 @@ def normalize_runtime_status_code(raw_status_code: str | None, runtime_status: d
         return "ORB_SKIPPED"
     if code in {"ENTRY_SUBMITTED", "ORDER_SENT", "LIVE_ORDER_CONFIRMED", "LIVE_EXECUTION_CONFIRMED"}:
         return "ORDER_SENT"
+    if code in {"ERROR"}:
+        return "ERROR"
     if code in {"DESYNC_SUSPECTED"}:
         return "DESYNC_SUSPECTED"
-    if code == "ERROR":
-        last_error = str(runtime_status.get("last_error") or "")
-        return "ORDER_SENT" if "Order rejected" in last_error else "DESYNC_SUSPECTED"
     return "ALIVE"
 
 
@@ -692,13 +901,19 @@ def status_rank(status_code: str) -> int:
         "ORDER_SENT": 5,
         "BROKER_ACCEPTED": 6,
         "EXECUTION_CONFIRMED": 7,
-        "DESYNC_SUSPECTED": 8,
-        "BROKER_ACCEPTANCE_ISSUE": 9,
+        "ERROR": 8,
+        "DESYNC_SUSPECTED": 9,
+        "BROKER_ACCEPTANCE_ISSUE": 10,
     }
     return ladder.get(status_code, 0)
 
 
-def message_for_status(status_code: str, orb_skip_reason: str | None = None) -> str:
+def message_for_status(
+    status_code: str,
+    orb_skip_reason: str | None = None,
+    runtime_status_message: str | None = None,
+    last_error: str | None = None,
+) -> str:
     if status_code == "ALIVE":
         return "I am alive."
     if status_code == "REALTIME_READY":
@@ -715,11 +930,29 @@ def message_for_status(status_code: str, orb_skip_reason: str | None = None) -> 
         return "The broker accepted the order."
     if status_code == "EXECUTION_CONFIRMED":
         return "The execution was confirmed in the NinjaTrader database."
+    if status_code == "ERROR":
+        if runtime_status_message:
+            return runtime_status_message
+        if last_error:
+            return last_error
+        return "Strategy paused managed order automation for safety."
     if status_code == "DESYNC_SUSPECTED":
-        return "I suspect a desync between ApolloES and persisted broker state."
+        return "I suspect a desync between the strategy and persisted broker state."
     if status_code == "BROKER_ACCEPTANCE_ISSUE":
         return "The broker did not accept the order."
     return "I am alive."
+
+
+def collapse_inactive_runtime_status(base_status: str, runtime_status: dict[str, Any]) -> str:
+    if base_status == "ORB_SKIPPED":
+        return "ORB_SKIPPED"
+    if runtime_status.get("orb_high") is not None and runtime_status.get("orb_low") is not None:
+        return "ORB_FORMED"
+    if parse_iso_utc(runtime_status.get("session_ready_utc")) is not None:
+        return "WAITING_FOR_ORB"
+    if parse_iso_utc(runtime_status.get("realtime_entered_utc")) is not None:
+        return "REALTIME_READY"
+    return "ALIVE"
 
 
 def normalize_skip_reason(raw_reason: str | None) -> str | None:
@@ -801,6 +1034,7 @@ def build_hybrid_runtime_statuses(
     execution_rows: list[sqlite3.Row],
     order_rows: list[sqlite3.Row],
     target_strategies: list[str],
+    open_trade_keys: set[tuple[str, str, str]],
 ) -> list[dict[str, Any]]:
     execution_index, order_index = build_db_confirmation_indexes(execution_rows, order_rows, target_strategies)
     hybrid_statuses: list[dict[str, Any]] = []
@@ -815,6 +1049,7 @@ def build_hybrid_runtime_statuses(
         orb_skip_reason = normalize_skip_reason(runtime_status.get("orb_skip_reason"))
         base_status = normalize_runtime_status_code(runtime_status.get("status_code"), runtime_status)
         order_sent_utc = parse_iso_utc(runtime_status.get("order_sent_utc") or runtime_status.get("entry_submitted_utc"))
+        realtime_entered_utc = parse_iso_utc(runtime_status.get("realtime_entered_utc"))
         nt_order_callback_seen_utc = parse_iso_utc(
             runtime_status.get("nt_order_callback_seen_utc") or runtime_status.get("live_order_confirmed_utc")
         )
@@ -822,21 +1057,61 @@ def build_hybrid_runtime_statuses(
             runtime_status.get("nt_execution_callback_seen_utc") or runtime_status.get("live_execution_confirmed_utc")
         )
         last_heartbeat_utc = runtime_status.get("last_heartbeat_utc") or ""
+        runtime_status_message = str(runtime_status.get("status_message") or "").strip()
+        runtime_order_submission_blocked = bool(
+            runtime_status.get("runtime_order_submission_blocked")
+            or runtime_status.get("runtimeOrderSubmissionBlocked")
+        )
+        series_sync = runtime_status.get("series_sync") if isinstance(runtime_status.get("series_sync"), dict) else None
+        series_sync_is_synchronized = None
+        if isinstance(series_sync, dict):
+            raw_is_synchronized = series_sync.get("is_synchronized")
+            if isinstance(raw_is_synchronized, bool):
+                series_sync_is_synchronized = raw_is_synchronized
 
         broker_accepted_dt = choose_confirmation_time(order_index.get(key, []), order_sent_utc)
         execution_confirmed_dt = choose_confirmation_time(execution_index.get(key, []), order_sent_utc)
 
         last_error = str(runtime_status.get("last_error") or "")
+        data_sync_error = series_sync_is_synchronized is False
+        runtime_safety_error = base_status == "ERROR" and not data_sync_error
+        latest_reference_utc = parse_iso_utc(last_heartbeat_utc) or datetime.now(UTC)
+        lifecycle_anchor = max(
+            [dt for dt in (order_sent_utc, nt_order_callback_seen_utc, nt_execution_callback_seen_utc) if dt is not None],
+            default=None,
+        )
+        lifecycle_is_recent = (
+            lifecycle_anchor is not None
+            and (latest_reference_utc - lifecycle_anchor).total_seconds() <= ORDER_LIFECYCLE_STALE_SECONDS
+        )
+        has_open_trade = (strategy, account, instrument) in open_trade_keys
+        historical_startup_submission = (
+            order_sent_utc is not None
+            and realtime_entered_utc is not None
+            and order_sent_utc < realtime_entered_utc
+        )
+        active_order_lifecycle = (
+            base_status in {"ORDER_SENT", "DESYNC_SUSPECTED"}
+            and not historical_startup_submission
+            and not runtime_order_submission_blocked
+            and (lifecycle_is_recent or has_open_trade)
+        )
+
         broker_acceptance_issue = False
-        if order_sent_utc is not None and execution_confirmed_dt is None and broker_accepted_dt is None:
+        if (
+            active_order_lifecycle
+            and order_sent_utc is not None
+            and execution_confirmed_dt is None
+            and broker_accepted_dt is None
+        ):
             if "Order rejected" in last_error:
                 broker_acceptance_issue = True
             elif (datetime.now(UTC) - order_sent_utc).total_seconds() >= DB_CONFIRMATION_WINDOW_SECONDS:
                 broker_acceptance_issue = True
 
-        desync_suspected = bool(runtime_status.get("desync_suspected"))
+        desync_suspected = False
         if (
-            not desync_suspected
+            active_order_lifecycle
             and nt_execution_callback_seen_utc is not None
             and execution_confirmed_dt is None
             and (datetime.now(UTC) - nt_execution_callback_seen_utc).total_seconds() >= DB_CONFIRMATION_WINDOW_SECONDS
@@ -844,10 +1119,19 @@ def build_hybrid_runtime_statuses(
             desync_suspected = True
 
         final_status = base_status
+        if (
+            base_status in {"ORDER_SENT", "DESYNC_SUSPECTED"}
+            and not active_order_lifecycle
+            and not data_sync_error
+            and not runtime_safety_error
+        ):
+            final_status = collapse_inactive_runtime_status(base_status, runtime_status)
         if broker_accepted_dt is not None and status_rank("BROKER_ACCEPTED") > status_rank(final_status):
             final_status = "BROKER_ACCEPTED"
         if execution_confirmed_dt is not None and status_rank("EXECUTION_CONFIRMED") > status_rank(final_status):
             final_status = "EXECUTION_CONFIRMED"
+        if (data_sync_error or runtime_safety_error) and status_rank("ERROR") > status_rank(final_status):
+            final_status = "ERROR"
         if desync_suspected and status_rank("DESYNC_SUSPECTED") > status_rank(final_status):
             final_status = "DESYNC_SUSPECTED"
         if broker_acceptance_issue and status_rank("BROKER_ACCEPTANCE_ISSUE") > status_rank(final_status):
@@ -857,22 +1141,45 @@ def build_hybrid_runtime_statuses(
             {
                 "strategy": strategy,
                 "account": account,
+                "instrument": instrument,
+                "instance_key": runtime_status.get("instance_key") or "",
                 "session_date": session_date,
                 "status_code": final_status,
-                "status_message": message_for_status(final_status, orb_skip_reason),
+                "status_message": message_for_status(
+                    final_status,
+                    orb_skip_reason,
+                    runtime_status_message=runtime_status_message or None,
+                    last_error=last_error or None,
+                ),
                 "last_heartbeat_utc": last_heartbeat_utc,
-                "is_healthy": not desync_suspected and not broker_acceptance_issue,
+                "is_healthy": (
+                    not data_sync_error
+                    and not runtime_safety_error
+                    and not desync_suspected
+                    and not broker_acceptance_issue
+                ),
+                "last_error": last_error,
                 "desync_suspected": desync_suspected,
                 "broker_acceptance_issue": broker_acceptance_issue,
+                "runtime_order_submission_blocked": runtime_order_submission_blocked,
+                "historical_startup_submission": historical_startup_submission,
+                "series_sync": series_sync if isinstance(series_sync, dict) else None,
                 "orb_skip_reason": orb_skip_reason or "",
                 "orb_high": runtime_status.get("orb_high"),
                 "orb_low": runtime_status.get("orb_low"),
                 "orb_range_ticks": runtime_status.get("orb_range_ticks"),
                 "order_sent_utc": order_sent_utc.isoformat().replace("+00:00", "Z") if order_sent_utc else "",
+                "realtime_entered_utc": (
+                    realtime_entered_utc.isoformat().replace("+00:00", "Z")
+                    if realtime_entered_utc
+                    else ""
+                ),
                 "broker_accepted_utc": broker_accepted_dt.isoformat().replace("+00:00", "Z") if broker_accepted_dt else "",
                 "execution_confirmed_utc": execution_confirmed_dt.isoformat().replace("+00:00", "Z") if execution_confirmed_dt else "",
                 "nt_order_callback_seen_utc": nt_order_callback_seen_utc.isoformat().replace("+00:00", "Z") if nt_order_callback_seen_utc else "",
                 "nt_execution_callback_seen_utc": nt_execution_callback_seen_utc.isoformat().replace("+00:00", "Z") if nt_execution_callback_seen_utc else "",
+                "heartbeat_age_seconds": runtime_status.get("_runtime_heartbeat_age_seconds"),
+                "source_file": runtime_status.get("_runtime_source_file") or "",
             }
         )
 
@@ -891,6 +1198,7 @@ def build_payload(
     try:
         rows = fetch_execution_rows(con, target_strategies)
         order_rows = fetch_order_rows(con, target_strategies)
+        all_execution_rows = fetch_all_execution_rows(con)
     finally:
         con.close()
 
@@ -965,14 +1273,58 @@ def build_payload(
         strategy_name = trade["strategy_name"]
         open_counts[strategy_name] = open_counts.get(strategy_name, 0) + 1
 
+    execution_derived_session = compute_execution_derived_session_realized(all_execution_rows)
+
     last_row = rows[-1] if rows else None
-    raw_runtime_statuses = load_runtime_statuses(runtime_status_dir, target_strategies) if runtime_status_dir else []
+    raw_runtime_statuses, runtime_status_summary = (
+        load_runtime_statuses(runtime_status_dir, target_strategies)
+        if runtime_status_dir
+        else (
+            [],
+            {
+                "directory_exists": False,
+                "directory_path": None,
+                "files_seen": 0,
+                "files_loaded": 0,
+                "non_object_count": 0,
+                "parse_error_count": 0,
+                "non_target_strategy_count": 0,
+                "missing_identity_count": 0,
+                "missing_heartbeat_count": 0,
+                "future_heartbeat_count": 0,
+                "stale_heartbeat_count": 0,
+                "latest_seen_heartbeat_utc": None,
+                "latest_loaded_heartbeat_utc": None,
+                "latest_file_mtime_utc": None,
+            },
+        )
+    )
     runtime_statuses = build_hybrid_runtime_statuses(
         runtime_statuses=raw_runtime_statuses,
         execution_rows=rows,
         order_rows=order_rows,
         target_strategies=target_strategies,
+        open_trade_keys={(trade["strategy_name"], trade["account_name"], trade["instrument_name"]) for trade in open_trades},
     )
+    warnings: list[str] = []
+    if runtime_status_dir and int(runtime_status_summary["files_seen"]) == 0:
+        warnings.append("No runtime-status files were found in the configured runtime-status directory.")
+    if int(runtime_status_summary["stale_heartbeat_count"]) > 0:
+        warnings.append(
+            f"Dropped {int(runtime_status_summary['stale_heartbeat_count'])} stale runtime-status file(s) because their heartbeats were older than {int(RUNTIME_STATUS_STALE_SECONDS)} seconds."
+        )
+    if int(runtime_status_summary["parse_error_count"]) > 0:
+        warnings.append(
+            f"Ignored {int(runtime_status_summary['parse_error_count'])} runtime-status file(s) because they could not be parsed as JSON."
+        )
+    if int(runtime_status_summary["missing_heartbeat_count"]) > 0:
+        warnings.append(
+            f"Ignored {int(runtime_status_summary['missing_heartbeat_count'])} runtime-status file(s) because they were missing last_heartbeat_utc."
+        )
+    if int(runtime_status_summary["future_heartbeat_count"]) > 0:
+        warnings.append(
+            f"Ignored {int(runtime_status_summary['future_heartbeat_count'])} runtime-status file(s) because their heartbeats were too far in the future."
+        )
     payload = {
         "generated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "source": {
@@ -983,6 +1335,7 @@ def build_payload(
             "last_execution_time_utc": nt_ticks_to_utc_iso(last_row["ExecutionTime"]) if last_row else None,
             "execution_rows_loaded": len(rows),
             "order_rows_loaded": len(order_rows),
+            "runtime_status_summary": runtime_status_summary,
             "watch_mode_ready": True,
         },
         "summary": {
@@ -994,11 +1347,23 @@ def build_payload(
             "closed_net_pnl_by_strategy": {
                 strategy: round_money(value) for strategy, value in closed_net_pnl.items()
             },
+            "execution_derived_session_date": execution_derived_session["session_date"],
+            "execution_derived_session_closed_trade_count": execution_derived_session["closed_trade_count"],
+            "execution_derived_session_realized_gross_pnl": execution_derived_session["realized_gross_pnl"],
+            "execution_derived_session_realized_total_costs": execution_derived_session["realized_total_costs"],
+            "execution_derived_session_realized_net_pnl": execution_derived_session["realized_net_pnl"],
+            "execution_derived_session_realized_net_pnl_by_account": execution_derived_session[
+                "realized_net_pnl_by_account"
+            ],
             "runtime_status_count": len(runtime_statuses),
+            "runtime_status_stale_dropped_count": int(runtime_status_summary["stale_heartbeat_count"]),
+            "runtime_status_parse_error_count": int(runtime_status_summary["parse_error_count"]),
+            "runtime_status_missing_heartbeat_count": int(runtime_status_summary["missing_heartbeat_count"]),
         },
         "closed_trades": closed_trades,
         "open_trades": open_trades,
         "runtime_statuses": runtime_statuses,
+        "warnings": warnings,
         "notes": [
             "Trades are reconstructed directly from NinjaTrader execution rows.",
             "Each trade contains nested entry and exit executions so scale-ins, partial exits, and signal names stay visible.",
